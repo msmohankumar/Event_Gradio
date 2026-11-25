@@ -1,908 +1,160 @@
-import os
-import io
-import zipfile
+import os, glob, shutil, zipfile, tempfile, json
+from pathlib import Path
+import gradio as gr
+import numpy as np
+from PIL import Image, ImageOps
+from deepface import DeepFace
 
-import requests
-import streamlit as st
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data" if Path("/data").exists() else "./data"))
+GALLERY_DIR = DATA_DIR / "gallery"
+GALLERY_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_FILE = DATA_DIR / "config.json"
+MODEL_NAME = "Facenet512"
+DISTANCE_THRESHOLD = 0.40
 
-from config_store import load_config, save_config
-from gallery import (
-    get_gallery_images,
-    clear_dropbox_gallery_cache,
-    dropbox_diagnostics,
-)
-from matcher import find_matches
-from utils import make_guest_url, make_qr
+def load_config():
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"event_name": "Event Photo Finder", "message": "Upload a selfie to find your event photos."}
 
+def save_config(event_name, message):
+    cfg={"event_name": (event_name or "Event Photo Finder").strip(),
+         "message": (message or "").strip()}
+    CONFIG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    return f"Saved event settings for: {cfg['event_name']}"
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
+def file_path(file):
+    if file is None: return None
+    if isinstance(file, str): return file
+    if isinstance(file, dict): return file.get("path") or file.get("name")
+    return getattr(file, "name", None)
 
-st.set_page_config(
-    page_title="Event Photo Finder",
-    page_icon="📸",
-    layout="wide",
-)
+def add_gallery_files(files):
+    if not files: return "Select one or more images first."
+    count=0
+    for f in files:
+        src=file_path(f)
+        if not src or not os.path.isfile(src): continue
+        ext=Path(src).suffix.lower()
+        if ext not in {".jpg",".jpeg",".png",".webp",".bmp"}: continue
+        dest=GALLERY_DIR / (Path(src).name)
+        # Avoid overwrite collisions
+        if dest.exists():
+            dest=GALLERY_DIR / f"{Path(src).stem}_{count}{ext}"
+        shutil.copy2(src, dest)
+        count+=1
+    return f"Added {count} image(s). Gallery now contains {len(gallery_files())} images."
 
-cfg = load_config()
+def gallery_files():
+    files=[]
+    for ext in ("*.jpg","*.jpeg","*.png","*.webp","*.bmp"):
+        files.extend(glob.glob(str(GALLERY_DIR/ext)))
+    return sorted(files)
 
+def clear_gallery():
+    for f in gallery_files():
+        try: os.remove(f)
+        except: pass
+    return "Gallery cleared.", []
 
-# ============================================================
-# GUEST INTERFACE
-# ============================================================
+def gallery_preview():
+    return [(f, Path(f).name) for f in gallery_files()]
 
-def guest_ui():
+def get_embedding(img_path):
+    reps=DeepFace.represent(img_path=img_path, model_name=MODEL_NAME,
+                            detector_backend="opencv", enforce_detection=True,
+                            align=True, normalization="base")
+    if not reps: return None
+    return np.asarray(reps[0]["embedding"], dtype=np.float32)
 
-    st.title("📸 Find Your Event Photos")
+def cosine_distance(a,b):
+    denom=np.linalg.norm(a)*np.linalg.norm(b)
+    if denom==0: return 1.0
+    return float(1.0-np.dot(a,b)/denom)
 
-    st.markdown(
-        """
-        ### Find your photos from the event!
-
-        Take a selfie or upload one or more photos.
-        We'll search the event gallery for photos containing you.
-        """
-    )
-
-    if not cfg.get("enabled", False):
-
-        st.warning(
-            "The event photo finder is currently disabled."
-        )
-        return
-
-    if not cfg.get("folder_url", ""):
-
-        st.warning(
-            "The gallery has not been configured."
-        )
-        return
-
-    st.markdown("---")
-
-    st.subheader(
-        cfg.get("event_name", "Event Gallery")
-    )
-
-    # --------------------------------------------------------
-    # SELFIE CAMERA
-    # --------------------------------------------------------
-
-    st.subheader("1. Take a selfie")
-
-    camera = st.camera_input(
-        "Take a selfie using your camera",
-        key="guest_camera",
-    )
-
-    # --------------------------------------------------------
-    # MULTIPLE SELFIE UPLOADS
-    # --------------------------------------------------------
-
-    st.subheader("2. Or upload one or more photos")
-
-    uploaded_files = st.file_uploader(
-        "Drag and drop your photos here",
-        type=["jpg", "jpeg", "png"],
-        accept_multiple_files=True,
-        key="guest_uploads",
-    )
-
-    # --------------------------------------------------------
-    # COLLECT ALL SELFIES
-    # --------------------------------------------------------
-
-    selfies = []
-
-    if camera is not None:
-
-        selfies.append({
-            "name": "Camera selfie",
-            "bytes": camera.getvalue(),
-        })
-
-    if uploaded_files:
-
-        for file in uploaded_files:
-
-            selfies.append({
-                "name": file.name,
-                "bytes": file.getvalue(),
-            })
-
-    # --------------------------------------------------------
-    # PREVIEW
-    # --------------------------------------------------------
-
-    if selfies:
-
-        st.success(
-            f"{len(selfies)} selfie/photo(s) selected."
-        )
-
-        preview_columns = st.columns(
-            min(4, len(selfies))
-        )
-
-        for index, selfie in enumerate(selfies):
-
-            with preview_columns[
-                index % len(preview_columns)
-            ]:
-
-                st.image(
-                    selfie["bytes"],
-                    caption=selfie["name"],
-                )
-
-    # --------------------------------------------------------
-    # THRESHOLD
-    # --------------------------------------------------------
-
-    threshold = st.slider(
-        "Matching sensitivity",
-        min_value=0.20,
-        max_value=0.70,
-        value=float(
-            cfg.get("threshold", 0.40)
-        ),
-        step=0.01,
-        help=(
-            "Lower values are stricter. "
-            "Higher values may find more matches, "
-            "but can also produce false matches."
-        ),
-    )
-
-    # --------------------------------------------------------
-    # SEARCH BUTTON
-    # --------------------------------------------------------
-
-    if selfies:
-
-        if st.button(
-            "🔎 Find My Photos",
-            type="primary",
-            use_container_width=True,
-        ):
-
-            st.session_state.pop(
-                "guest_matches",
-                None,
-            )
-
-            st.session_state.pop(
-                "guest_errors",
-                None,
-            )
-
+def match_faces(selfie):
+    cfg=load_config()
+    if selfie is None:
+        return "Please upload or capture a selfie.", []
+    gallery=gallery_files()
+    if not gallery:
+        return "The event gallery is empty. Ask the organizer to add photos.", []
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        selfie_path=tmp.name
+    try:
+        im=Image.fromarray(selfie.astype("uint8")) if isinstance(selfie,np.ndarray) else Image.open(selfie)
+        im=ImageOps.exif_transpose(im).convert("RGB")
+        im.save(selfie_path, quality=95)
+        emb=get_embedding(selfie_path)
+        if emb is None: return "No face detected in your selfie. Try another photo.", []
+        results=[]
+        for p in gallery:
             try:
-
-                # --------------------------------------------
-                # LOAD EVENT GALLERY
-                # --------------------------------------------
-
-                with st.spinner(
-                    "Loading event gallery..."
-                ):
-
-                    gallery_images = (
-                        get_gallery_images(cfg)
-                    )
-
-                if not gallery_images:
-
-                    st.error(
-                        "No gallery images were loaded."
-                    )
-
-                    return
-
-                st.success(
-                    f"{len(gallery_images)} gallery images loaded."
-                )
-
-                # --------------------------------------------
-                # SEARCH USING EACH SELFIE
-                # --------------------------------------------
-
-                combined_matches = {}
-
-                combined_errors = []
-
-                progress = st.progress(0)
-
-                status = st.empty()
-
-                for selfie_index, selfie in enumerate(
-                    selfies
-                ):
-
-                    status.write(
-                        f"Searching using "
-                        f"{selfie['name']} "
-                        f"({selfie_index + 1}/"
-                        f"{len(selfies)})..."
-                    )
-
-                    try:
-
-                        matches, errors = find_matches(
-                            selfie["bytes"],
-                            gallery_images,
-                            threshold,
-                        )
-
-                        combined_errors.extend(
-                            errors
-                        )
-
-                        # ------------------------------------
-                        # MERGE MATCHES
-                        # ------------------------------------
-
-                        for match in matches:
-
-                            name = match["name"]
-
-                            if name not in combined_matches:
-
-                                combined_matches[name] = match
-
-                            else:
-
-                                # Keep the best distance.
-                                if (
-                                    match["distance"]
-                                    < combined_matches[name]["distance"]
-                                ):
-
-                                    combined_matches[name] = match
-
-                    except Exception as exc:
-
-                        combined_errors.append(
-                            f"{selfie['name']}: {exc}"
-                        )
-
-                    progress.progress(
-                        (selfie_index + 1)
-                        / len(selfies)
-                    )
-
-                status.empty()
-
-                progress.empty()
-
-                # --------------------------------------------
-                # SORT MATCHES
-                # --------------------------------------------
-
-                final_matches = sorted(
-                    combined_matches.values(),
-                    key=lambda item: item["distance"],
-                )
-
-                st.session_state[
-                    "guest_matches"
-                ] = final_matches
-
-                st.session_state[
-                    "guest_errors"
-                ] = combined_errors
-
-                st.session_state[
-                    "guest_total_images"
-                ] = len(gallery_images)
-
-                st.session_state[
-                    "guest_selfie_count"
-                ] = len(selfies)
-
-            except Exception as exc:
-
-                st.error(
-                    f"Search failed: {exc}"
-                )
-
-    else:
-
-        st.info(
-            "Take a selfie or upload one or more photos "
-            "to begin searching."
-        )
-
-    # ========================================================
-    # RESULTS
-    # ========================================================
-
-    if "guest_matches" not in st.session_state:
-
-        return
-
-    matches = st.session_state[
-        "guest_matches"
-    ]
-
-    errors = st.session_state.get(
-        "guest_errors",
-        [],
-    )
-
-    total_images = st.session_state.get(
-        "guest_total_images",
-        0,
-    )
-
-    st.markdown("---")
-
-    st.subheader("🎉 Search Results")
-
-    st.write(
-        f"Gallery images: {total_images}"
-    )
-
-    st.write(
-        f"Matching photos: {len(matches)}"
-    )
-
-    # --------------------------------------------------------
-    # MATCHES
-    # --------------------------------------------------------
-
-    if not matches:
-
-        st.warning(
-            "No matching photos were found. "
-            "Try another selfie or adjust the sensitivity."
-        )
-
-    else:
-
-        st.success(
-            f"Found {len(matches)} matching photos!"
-        )
-
-        # --------------------------------------------
-        # DISPLAY MATCHES
-        # --------------------------------------------
-
-        columns = st.columns(3)
-
-        for index, match in enumerate(matches):
-
-            with columns[index % 3]:
-
-                st.image(
-                    match["preview"],
-                    use_container_width=True,
-                )
-
-                st.caption(
-                    f"{match['name']}"
-                )
-
-                st.caption(
-                    f"Match distance: "
-                    f"{match['distance']:.4f}"
-                )
-
-                st.download_button(
-                    "⬇️ Download",
-                    data=match["original"],
-                    file_name=match["name"],
-                    mime="application/octet-stream",
-                    key=f"download_{index}",
-                    use_container_width=True,
-                )
-
-        # ----------------------------------------------------
-        # DOWNLOAD ALL MATCHES
-        # ----------------------------------------------------
-
-        if len(matches) > 1:
-
-            zip_buffer = io.BytesIO()
-
-            with zipfile.ZipFile(
-                zip_buffer,
-                "w",
-                zipfile.ZIP_DEFLATED,
-            ) as archive:
-
-                for match in matches:
-
-                    archive.writestr(
-                        match["name"],
-                        match["original"],
-                    )
-
-            st.download_button(
-                "📦 Download all matching photos",
-                data=zip_buffer.getvalue(),
-                file_name="my_event_photos.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
-
-    # --------------------------------------------------------
-    # ERRORS
-    # --------------------------------------------------------
-
-    if errors:
-
-        st.markdown(
-            "### Processing errors"
-        )
-
-        for error in errors[:20]:
-
-            st.warning(
-                str(error)
-            )
-
-        if len(errors) > 20:
-
-            st.caption(
-                f"{len(errors) - 20} additional errors omitted."
-            )
-
-
-# ============================================================
-# ORGANIZER INTERFACE
-# ============================================================
-
-def admin_ui():
-
-    st.title("⚙️ Event Organizer")
-
-    # --------------------------------------------------------
-    # LOGIN
-    # --------------------------------------------------------
-
-    if not st.session_state.get(
-        "admin_authenticated",
-        False,
-    ):
-
-        password = st.text_input(
-            "Organizer password",
-            type="password",
-            key="admin_password",
-        )
-
-        if st.button("🔐 Login"):
-
-            expected = st.secrets.get(
-                "ADMIN_PASSWORD",
-                os.getenv("ADMIN_PASSWORD", ""),
-            )
-
-            if expected and password == expected:
-
-                st.session_state[
-                    "admin_authenticated"
-                ] = True
-
-                st.rerun()
-
-            elif not expected:
-
-                st.error(
-                    "ADMIN_PASSWORD is not configured."
-                )
-
-            else:
-
-                st.error(
-                    "Incorrect password."
-                )
-
-        return
-
-    # --------------------------------------------------------
-    # DROPBOX REFRESH TOKEN SETUP (BROWSER ONLY)
-    # --------------------------------------------------------
-
-    st.markdown("---")
-    st.subheader("🔑 Dropbox Refresh Token Setup")
-    st.caption(
-        "Use this one-time browser workflow to exchange a Dropbox "
-        "authorization code for a refresh token. This section is visible "
-        "only after organizer login."
-    )
-
-    oauth_app_key = st.secrets.get("DROPBOX_APP_KEY", "")
-    oauth_app_secret = st.secrets.get("DROPBOX_APP_SECRET", "")
-
-    if not oauth_app_key or not oauth_app_secret:
-        st.warning(
-            "First add DROPBOX_APP_KEY and DROPBOX_APP_SECRET to "
-            "Streamlit Cloud → App settings → Secrets, then reload this app."
-        )
-    else:
-        auth_url = (
-            "https://www.dropbox.com/oauth2/authorize?client_id="
-            + oauth_app_key
-            + "&response_type=code&token_access_type=offline"
-        )
-        st.markdown("**Step 1 — Authorize your Dropbox app**")
-        st.markdown(
-            "Open this link, approve the app, and copy the code Dropbox displays."
-        )
-        st.code(auth_url, language="text")
-        st.link_button("Open Dropbox Authorization", auth_url)
-
-        st.markdown("**Step 2 — Paste the authorization code here**")
-        oauth_code = st.text_input(
-            "Dropbox authorization code",
-            key="dropbox_oauth_code",
-            help="Paste the code displayed by Dropbox after approving the app.",
-        )
-
-        if st.button("🔄 Exchange Code for Refresh Token", key="exchange_dropbox_code"):
-            if not oauth_code.strip():
-                st.error("Paste the authorization code first.")
-            else:
-                try:
-                    with st.spinner("Exchanging authorization code with Dropbox..."):
-                        oauth_response = requests.post(
-                            "https://api.dropbox.com/oauth2/token",
-                            data={
-                                "code": oauth_code.strip(),
-                                "grant_type": "authorization_code",
-                            },
-                            auth=(oauth_app_key, oauth_app_secret),
-                            timeout=30,
-                        )
-
-                    if oauth_response.ok:
-                        oauth_data = oauth_response.json()
-                        refresh_token_result = oauth_data.get("refresh_token")
-                        if refresh_token_result:
-                            st.session_state["dropbox_refresh_token_result"] = refresh_token_result
-                            st.success("Refresh token generated successfully. Copy it into Streamlit Secrets.")
-                        else:
-                            st.error("Dropbox response did not include a refresh token. Make sure the authorization link used token_access_type=offline.")
-                    else:
-                        st.error(
-                            "Dropbox rejected the authorization code: "
-                            + str(oauth_response.status_code)
-                            + " — "
-                            + oauth_response.text[:500]
-                        )
-                except Exception as exc:
-                    st.error(f"Token exchange failed: {exc}")
-
-        if st.session_state.get("dropbox_refresh_token_result"):
-            st.markdown("**Step 3 — Copy this Refresh Token**")
-            st.warning(
-                "This token is sensitive. Do not share it or commit it to GitHub. "
-                "Copy it into Streamlit Cloud Secrets, then remove this temporary setup section/code if desired."
-            )
-            st.code(st.session_state["dropbox_refresh_token_result"], language="text")
-            st.markdown("Add or update this entry in Streamlit Cloud Secrets:")
-            st.code(
-                'DROPBOX_REFRESH_TOKEN = "paste_the_generated_token_here"',
-                language="toml",
-            )
-
-    # --------------------------------------------------------
-    # CONFIGURATION
-    # --------------------------------------------------------
-
-    st.subheader("Event Configuration")
-
-    event_name = st.text_input(
-        "Event name",
-        value=cfg.get(
-            "event_name",
-            "Event Gallery",
-        ),
-    )
-
-    providers = {
-        "Google Drive": "drive",
-        "Dropbox": "dropbox",
-        "Local folder": "local",
-        "Azure Blob Storage": "azure",
-        "Amazon S3": "s3",
-        "TeraBox": "terabox",
-    }
-
-    labels = list(providers.keys())
-
-    current_provider = cfg.get(
-        "provider",
-        "dropbox",
-    )
-
-    current_label = next(
-        (
-            label
-            for label, value in providers.items()
-            if value == current_provider
-        ),
-        "Dropbox",
-    )
-
-    provider_label = st.selectbox(
-        "Gallery provider",
-        labels,
-        index=labels.index(current_label),
-    )
-
-    provider = providers[
-        provider_label
-    ]
-
-    label_map = {
-        "drive": "Google Drive folder link",
-        "dropbox": "Dropbox shared folder link",
-        "local": "Local folder path",
-        "azure": "Azure container name",
-        "s3": "S3 bucket name",
-        "terabox": "TeraBox shared link",
-    }
-
-    folder_url = st.text_input(
-        label_map[provider],
-        value=cfg.get(
-            "folder_url",
-            "",
-        ),
-    )
-
-    threshold = st.slider(
-        "Default matching sensitivity",
-        min_value=0.20,
-        max_value=0.70,
-        value=float(
-            cfg.get(
-                "threshold",
-                0.40,
-            )
-        ),
-        step=0.01,
-    )
-
-    enabled = st.toggle(
-        "Enable guest photo finder",
-        value=bool(
-            cfg.get(
-                "enabled",
-                True,
-            )
-        ),
-    )
-
-    # --------------------------------------------------------
-    # SAVE
-    # --------------------------------------------------------
-
-    if st.button(
-        "💾 Save Configuration",
-        type="primary",
-    ):
-
-        new_config = {
-            "event_name": event_name,
-            "provider": provider,
-            "folder_url": folder_url.strip(),
-            "threshold": threshold,
-            "enabled": enabled,
-        }
-
-        try:
-
-            save_config(
-                new_config
-            )
-
-            st.success(
-                "Configuration saved successfully."
-            )
-
-            st.rerun()
-
-        except Exception as exc:
-
-            st.error(
-                f"Save failed: {exc}"
-            )
-
-    # --------------------------------------------------------
-    # QR
-    # --------------------------------------------------------
-
-    st.markdown("---")
-
-    st.subheader("📱 Guest QR Code")
-
-    guest_url = make_guest_url()
-
-    qr = make_qr(
-        guest_url
-    )
-
-    st.image(
-        qr,
-        width=250,
-    )
-
-    st.code(
-        guest_url
-    )
-
-    st.download_button(
-        "⬇️ Download QR Code",
-        data=qr.getvalue(),
-        file_name="event_guest_qr.png",
-        mime="image/png",
-    )
-
-    # --------------------------------------------------------
-    # DROPBOX CACHE
-    # --------------------------------------------------------
-
-    if provider == "dropbox":
-
-        st.markdown("---")
-
-        st.subheader(
-            "Dropbox Cache"
-        )
-
-        if st.button(
-            "🔄 Clear Dropbox Cache",
-        ):
-
-            clear_dropbox_gallery_cache()
-
-            st.success(
-                "Dropbox cache cleared."
-            )
-
-    # --------------------------------------------------------
-    # GALLERY TEST
-    # --------------------------------------------------------
-
-    st.markdown("---")
-
-    st.subheader("🧪 Test Gallery")
-
-    if st.button("Test Gallery"):
-
-        test_cfg = {
-            **cfg,
-            "provider": provider,
-            "folder_url": folder_url.strip(),
-        }
-
-        try:
-
-            with st.spinner(
-                "Testing gallery..."
-            ):
-
-                if provider == "dropbox":
-
-                    images, errors, listed = (
-                        dropbox_diagnostics(
-                            folder_url.strip()
-                        )
-                    )
-
-                else:
-
-                    images = get_gallery_images(
-                        test_cfg
-                    )
-
-                    errors = []
-
-                    listed = len(images)
-
-            st.write(
-                f"Images listed: {listed}"
-            )
-
-            st.write(
-                f"Images downloaded: {len(images)}"
-            )
-
-            st.write(
-                f"Download failures: {len(errors)}"
-            )
-
-            if listed and images:
-
-                st.success(
-                    "Gallery test completed successfully."
-                )
-
-            elif listed:
-
-                st.warning(
-                    "Files were listed, but downloads failed."
-                )
-
-            else:
-
-                st.warning(
-                    "No images were found."
-                )
-
-            if images:
-
-                st.markdown(
-                    "### Sample photos"
-                )
-
-                sample = images[:5]
-
-                columns = st.columns(
-                    min(3, len(sample))
-                )
-
-                for index, item in enumerate(sample):
-
-                    with columns[
-                        index % len(columns)
-                    ]:
-
-                        st.image(
-                            item["preview"],
-                            caption=item["name"],
-                        )
-
-            if errors:
-
-                st.markdown(
-                    "### Download errors"
-                )
-
-                for error in errors[:20]:
-
-                    st.error(
-                        str(error)
-                    )
-
-                if len(errors) > 20:
-
-                    st.caption(
-                        f"{len(errors) - 20} "
-                        "additional errors omitted."
-                    )
-
-        except Exception as exc:
-
-            st.error(
-                f"Gallery test failed: {exc}"
-            )
-
-    # --------------------------------------------------------
-    # LOGOUT
-    # --------------------------------------------------------
-
-    st.markdown("---")
-
-    if st.button("🚪 Logout"):
-
-        st.session_state[
-            "admin_authenticated"
-        ] = False
-
-        st.rerun()
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-guest_ui()
-
-with st.expander("⚙️ Organizer Login"):
-
-    admin_ui()
+                cand=get_embedding(p)
+                if cand is None: continue
+                dist=cosine_distance(emb,cand)
+                if dist <= DISTANCE_THRESHOLD:
+                    results.append((dist,p))
+            except Exception:
+                continue
+        results.sort(key=lambda x:x[0])
+        matches=[p for _,p in results]
+        if not matches:
+            return "No close matches found. Try a clear, front-facing selfie.", []
+        return f"Found {len(matches)} matching photo(s) for {cfg.get('event_name','your event')}!", [(p,Path(p).name) for p in matches]
+    except Exception as e:
+        return f"Face matching failed: {type(e).__name__}: {e}", []
+    finally:
+        try: os.remove(selfie_path)
+        except: pass
+
+def make_zip(gallery):
+    if not gallery: return None
+    selected=[]
+    for item in gallery:
+        if isinstance(item, (tuple,list)): item=item[0]
+        if isinstance(item,str) and os.path.isfile(item): selected.append(item)
+    if not selected: return None
+    tmp=tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    tmp.close()
+    with zipfile.ZipFile(tmp.name,"w",zipfile.ZIP_DEFLATED) as z:
+        for i,p in enumerate(selected):
+            z.write(p, arcname=f"{i+1}_{Path(p).name}")
+    return tmp.name
+
+cfg=load_config()
+with gr.Blocks(theme=gr.themes.Soft(), title=cfg.get("event_name","Event Photo Finder")) as demo:
+    gr.Markdown("# 📸 Event Photo Finder")
+    gr.Markdown(cfg.get("message","Upload a selfie to find your event photos."))
+    with gr.Tab("Find My Photos"):
+        selfie=gr.Image(label="Upload or take a selfie", sources=["upload","webcam"], type="numpy")
+        find_btn=gr.Button("🔍 Find My Photos", variant="primary")
+        status=gr.Markdown()
+        matches=gr.Gallery(label="Matching Photos", columns=3, height="auto", object_fit="contain")
+        zip_btn=gr.Button("📦 Prepare ZIP of Matches")
+        zip_out=gr.File(label="Download matching photos (ZIP)")
+        find_btn.click(match_faces, inputs=selfie, outputs=[status,matches])
+        zip_btn.click(make_zip, inputs=matches, outputs=zip_out)
+    with gr.Tab("Organizer"):
+        gr.Markdown("### Event settings")
+        event_name=gr.Textbox(label="Event name", value=cfg.get("event_name","Event Photo Finder"))
+        event_message=gr.Textbox(label="Message shown to guests", value=cfg.get("message","Upload a selfie to find your event photos."), lines=2)
+        save_btn=gr.Button("Save event settings")
+        save_status=gr.Textbox(label="Status", interactive=False)
+        save_btn.click(save_config, inputs=[event_name,event_message], outputs=save_status)
+        gr.Markdown("### Add gallery photos")
+        gallery_upload=gr.File(label="Choose event photos", file_count="multiple", file_types=["image"])
+        add_btn=gr.Button("Add Photos to Gallery")
+        add_status=gr.Textbox(label="Upload status", interactive=False)
+        add_btn.click(add_gallery_files, inputs=gallery_upload, outputs=add_status)
+        refresh_btn=gr.Button("Refresh gallery preview")
+        preview=gr.Gallery(label="Current event gallery", columns=4, height="auto")
+        refresh_btn.click(gallery_preview, inputs=None, outputs=preview)
+        clear_btn=gr.Button("Clear Gallery", variant="stop")
+        clear_status=gr.Textbox(label="Clear status", interactive=False)
+        clear_btn.click(clear_gallery, inputs=None, outputs=[clear_status,preview])
+        demo.load(gallery_preview, inputs=None, outputs=preview)
+
+if __name__ == "__main__":
+    demo.launch()
