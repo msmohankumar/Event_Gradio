@@ -3,24 +3,20 @@ title: Event Photo Finder
 emoji: 📸
 colorFrom: blue
 colorTo: purple
-sdk: docker
-app_port: 7860
+sdk: gradio
+app_file: app.py
 pinned: false
 ---
 
 # Event Photo Finder
 
-Streamlit event-photo finder with selfie capture/upload, AI face matching, gallery provider configuration, QR access, and downloads.
+Guests can upload or capture a selfie to search for event photos using face similarity matching.
 
-## Hugging Face Spaces setup
+## Organizer
+Use the **Organizer** tab to configure the event and add event-gallery photos.
 
-This repository uses the **Docker SDK** because the application is Streamlit (not Gradio).
-
-In your Space Settings, add these as Secrets if the app uses Supabase shared configuration:
-
-- `SUPABASE_URL`
-- `SUPABASE_KEY`
-
-The app can start without these secrets; shared configuration save/load through Supabase will be unavailable until credentials are added.
-
-The Space builds and starts the Streamlit application using the included Dockerfile.
+## Notes
+- The app stores its gallery in `./data` or `/data` if that directory exists.
+- On Hugging Face Spaces, runtime storage may be ephemeral unless persistent storage is configured.
+- Uploaded gallery images are stored on the Space server.
+- This is a similarity-based face search, not identity verification. Obtain consent before uploading or processing faces.
